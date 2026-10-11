@@ -1,0 +1,14 @@
+{
+  "name": "kontrol-zadach",
+  "version": "3.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Особистий застосунок для задач з синхронізацією між пристроями (Vercel + Upstash Redis + Vercel Blob)",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@vercel/blob": "2.8.0",
+    "web-push": "3.6.7"
+  }
+}
