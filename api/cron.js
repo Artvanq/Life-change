@@ -85,7 +85,7 @@ export default async function handler(req, res) {
   if (old.length) {
     for (let i = 0; i < old.length; i += 200) await redis(['HDEL', TASKS, ...old.slice(i, i + 200).map((t) => t.id)]);
     report.purged = old.length;
-    if (process.env.BLOB_READ_WRITE_TOKEN) {
+    if (process.env.BLOB_READ_WRITE_TOKEN || process.env.BLOB_STORE_ID) {
       const paths = old.flatMap((t) => (t.attachments || []).map((a) => a.pathname)).filter(Boolean);
       if (paths.length) { try { const { del } = await import('@vercel/blob'); await del(paths); } catch { /* не критично */ } }
     }

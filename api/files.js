@@ -9,7 +9,7 @@ import { guard } from './_lib.js';
 const MAX = 4.4 * 1024 * 1024; // ліміт тіла запиту функцій Vercel ≈ 4.5 МБ
 
 function blobConfigured(res) {
-  if (process.env.BLOB_READ_WRITE_TOKEN) return true;
+  if (process.env.BLOB_READ_WRITE_TOKEN || process.env.BLOB_STORE_ID) return true;
   res.status(500).json({
     error: 'blob_not_configured',
     message: 'Файли ще не підключені: у Vercel відкрийте Storage → Create → Blob, підключіть до проєкту і зробіть Redeploy.',
