@@ -17,7 +17,7 @@ export async function redis(cmd) {
   return j.result;
 }
 
-function safeEqual(a, b) {
+export function safeEqual(a, b) {
   const ha = crypto.createHash('sha256').update(String(a)).digest();
   const hb = crypto.createHash('sha256').update(String(b)).digest();
   return crypto.timingSafeEqual(ha, hb);
@@ -44,10 +44,20 @@ export async function guard(req, res, { needRedis = true } = {}) {
 }
 
 export async function readJson(req) {
+  try {
   if (req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body)) return req.body;
   if (typeof req.body === 'string') return JSON.parse(req.body);
   const chunks = [];
-  for await (const c of req) chunks.push(c);
+  let size = 0;
+  for await (const c of req) {
+    size += Buffer.byteLength(c);
+    if (size > 1_500_000) throw Object.assign(new Error('Запит завеликий'), { status: 413 });
+    chunks.push(Buffer.from(c));
+  }
   const raw = Buffer.concat(chunks).toString('utf8');
   return raw ? JSON.parse(raw) : {};
+  } catch (e) {
+    if (e instanceof SyntaxError) throw Object.assign(new Error('Некоректний JSON'), { status: 400 });
+    throw e;
+  }
 }

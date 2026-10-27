@@ -5,8 +5,9 @@
 //   • остаточне видалення задач, що пролежали в кошику понад 30 днів.
 // Vercel Cron викликає її раз на день (vercel.json). Для точних нагадувань протягом дня
 // її можна викликати частіше зовнішнім таймером: /api/cron?secret=<CRON_SECRET> (див. README).
-import { redis, REDIS_URL, REDIS_TOKEN } from './_lib.js';
+import { redis, safeEqual, REDIS_URL, REDIS_TOKEN } from './_lib.js';
 import { getSettings, sendAll, localParts } from './_push.js';
+import { unreferencedAttachments } from './_attachments.js';
 
 const TASKS = 'kz:tasks';
 const DAY = 86400000;
@@ -15,7 +16,7 @@ const plural = (n, f) => { const a = Math.abs(n) % 100, b = a % 10; if (a > 10 &
 function authorized(req) {
   const secret = process.env.CRON_SECRET;
   const ua = String(req.headers['user-agent'] || '');
-  if (secret) return req.headers.authorization === `Bearer ${secret}` || req.query.secret === secret;
+  if (secret) return safeEqual(req.headers.authorization || '', `Bearer ${secret}`) || safeEqual(req.query.secret || '', secret);
   return ua.startsWith('vercel-cron');
 }
 
@@ -51,6 +52,10 @@ export default async function handler(req, res) {
       await redis(['HSET', 'kz:reminded', t.id, t.remindAt]);
       report.reminders++;
     }
+    // позначки задач, у яких більше немає нагадування, лише займали б місце
+    const withReminder = new Set(live.filter((t) => t.remindAt).map((t) => t.id));
+    const stale = Object.keys(reminded).filter((id) => !withReminder.has(id));
+    for (let i = 0; i < stale.length; i += 200) await redis(['HDEL', 'kz:reminded', ...stale.slice(i, i + 200)]);
   }
 
   // 2. Ранкове зведення
@@ -86,7 +91,8 @@ export default async function handler(req, res) {
     for (let i = 0; i < old.length; i += 200) await redis(['HDEL', TASKS, ...old.slice(i, i + 200).map((t) => t.id)]);
     report.purged = old.length;
     if (process.env.BLOB_READ_WRITE_TOKEN || process.env.BLOB_STORE_ID) {
-      const paths = old.flatMap((t) => (t.attachments || []).map((a) => a.pathname)).filter(Boolean);
+      const removedIds = new Set(old.map(t => t.id));
+      const paths = unreferencedAttachments(old, tasks.filter(t => !removedIds.has(t.id)));
       if (paths.length) { try { const { del } = await import('@vercel/blob'); await del(paths); } catch { /* не критично */ } }
     }
   }

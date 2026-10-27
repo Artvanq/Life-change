@@ -31,6 +31,7 @@ export default async function handler(req, res) {
 
     if (req.method === 'POST') {
       const body = await readJson(req);
+      if (!body || typeof body !== 'object' || Array.isArray(body)) return res.status(400).json({ error: 'bad_request', message: 'Очікується об’єкт' });
       const puts = Array.isArray(body.put) ? body.put.map(prepare) : [];
       const dels = Array.isArray(body.del) ? body.del.map(String).filter((id) => ID_RE.test(id)) : [];
       // частинами, щоб не впертися в ліміт розміру запиту Redis

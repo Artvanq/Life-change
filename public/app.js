@@ -47,8 +47,13 @@ const clone = (o) => JSON.parse(JSON.stringify(o));
 const rid = (p) => (p || 't') + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 const plural = (n, f) => { const a = Math.abs(n) % 100, b = a % 10; if (a > 10 && a < 20) return f[2]; if (b > 1 && b < 5) return f[1]; if (b === 1) return f[0]; return f[2]; };
 const DAYS = ['день', 'дні', 'днів'], TASKS_W = ['задачу', 'задачі', 'задач'], TASKS_N = ['задача', 'задачі', 'задач'];
-const fmt = (s, o) => new Intl.DateTimeFormat('uk-UA', o).format(parseYmd(s));
-const fmtDT = (iso) => new Intl.DateTimeFormat('uk-UA', { day: 'numeric', month: 'long', hour: '2-digit', minute: '2-digit' }).format(new Date(iso));
+// Некоректна дата не повинна зупиняти відмальовування всього застосунку.
+const fmt = (s, o) => { const d = typeof s === 'string' ? parseYmd(s) : new Date(NaN); return isNaN(d) ? '—' : new Intl.DateTimeFormat('uk-UA', o).format(d); };
+const fmtDT = (iso) => { const d = new Date(iso); return iso == null || isNaN(d) ? '—' : new Intl.DateTimeFormat('uk-UA', { day: 'numeric', month: 'long', hour: '2-digit', minute: '2-digit' }).format(d); };
+const ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+const isYmd = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s) && ymd(parseYmd(s)) === s;
+const isHm = (s) => typeof s === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(s);
+const isIso = (s) => typeof s === 'string' && !isNaN(Date.parse(s));
 const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
 const nowIso = () => new Date().toISOString();
 const PRIO = { 1: 'Критичний', 2: 'Високий', 3: 'Звичайний', 4: 'Низький' };
@@ -86,7 +91,14 @@ let TOKEN = null; try { TOKEN = localStorage.getItem(TKEY); } catch (e) {}
 function lsGet(k, d) { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch (e) { return d; } }
 function lsSet(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
 function persistLocal() { lsSet(LKEY, S.tasks); lsSet(PKEY, S.pending); }
-function loadLocal() { S.tasks = lsGet(LKEY, []).map(normalize); S.pending = lsGet(PKEY, {}); }
+function loadLocal() {
+  const tasks = lsGet(LKEY, []), pending = lsGet(PKEY, {});
+  S.tasks = Array.isArray(tasks) ? tasks.filter(t => t && typeof t === 'object' && t.id).map(normalize) : [];
+  S.pending = pending && typeof pending === 'object' && !Array.isArray(pending) ? pending : {};
+  for (const [id, op] of Object.entries(S.pending)) {
+    if (!op || !['put', 'del'].includes(op.op) || (op.op === 'put' && !op.task)) delete S.pending[id];
+  }
+}
 
 async function api(method, path, body, raw) {
   const r = await fetch(path, {
@@ -106,9 +118,9 @@ const apiJson = (m, p, b) => api(m, p, b).then((r) => r.json());
 let flushing = false, flushTimer = null;
 function scheduleFlush(ms) { clearTimeout(flushTimer); flushTimer = setTimeout(flush, ms == null ? 350 : ms); }
 async function flush() {
-  if (flushing || !TOKEN) return;
+  if (flushing || !TOKEN) return false;
   const ids = Object.keys(S.pending);
-  if (!ids.length) { S.sync = 'ok'; renderSync(); return; }
+  if (!ids.length) { S.sync = 'ok'; renderSync(); return true; }
   flushing = true;
   const snap = {}; ids.forEach((id) => { snap[id] = S.pending[id]; });
   const put = [], del = [];
@@ -129,12 +141,26 @@ async function flush() {
     flushing = false; renderSync();
     if (ok && Object.keys(S.pending).length) scheduleFlush(200);
   }
+  return ok;
 }
+let pulling = false, pullEdits = null;
 async function pull() {
-  if (!TOKEN) return;
+  if (!TOKEN || flushing || pulling) return false;
+  pulling = true;
+  const token = TOKEN;
+  const pendingAtStart = { ...S.pending };
+  pullEdits = pendingAtStart;
+  try { return await pullTasks(token, pendingAtStart); } finally { pulling = false; pullEdits = null; }
+}
+async function pullTasks(token, pendingAtStart) {
   try {
     const j = await apiJson('GET', '/api/tasks');
+    if (TOKEN !== token) return false;
     const map = new Map((j.tasks || []).map((t) => [t.id, normalize(t)]));
+    // Keep edits acknowledged while this older GET was in flight.
+    for (const [id, op] of Object.entries(pendingAtStart)) {
+      if (op.op === 'put') map.set(id, op.task); else map.delete(id);
+    }
     for (const id of Object.keys(S.pending)) { const op = S.pending[id]; if (op.op === 'put') map.set(id, op.task); else map.delete(id); }
     const next = [...map.values()];
     const changed = JSON.stringify(next) !== JSON.stringify(S.tasks);
@@ -143,10 +169,12 @@ async function pull() {
     persistLocal();
     if (changed) afterRemoteChange(); else renderSync();
     if (Object.keys(S.pending).length) scheduleFlush(0);
+    return true;
   } catch (e) {
     if (e.code === 'auth') return logout('Невірний пароль.');
     S.sync = navigator.onLine === false ? 'offline' : 'error'; S.syncErr = e.message;
     renderSync();
+    return false;
   }
 }
 function afterRemoteChange() {
@@ -161,6 +189,8 @@ function upsertLocal(t) { const i = S.tasks.findIndex((x) => x.id === t.id); if 
 /* Єдина точка змін: зберігає, ставить у чергу синхронізації, за потреби дає «Скасувати». */
 function apply(puts, dels, label, opts) {
   puts = puts || []; dels = dels || []; opts = opts || {};
+  // «Скасувати» повернув би старий стан і стер би пізніші правки тих самих задач
+  if (!label && S.undo) { const ids = new Set(puts.map((t) => t.id).concat(dels)); if (S.undo.before.some((b) => ids.has(b.id))) S.undo = null; }
   const before = [];
   const stamp = nowIso();
   for (const t of puts) {
@@ -171,12 +201,14 @@ function apply(puts, dels, label, opts) {
     if (!opts.noHistory) recordHistory(prev, t, stamp);
     upsertLocal(t);
     S.pending[t.id] = { op: 'put', task: t };
+    if (pullEdits) pullEdits[t.id] = S.pending[t.id];
   }
   for (const id of dels) {
     const prev = getTask(id); if (!prev) continue;
     before.push(clone(prev));
     S.tasks = S.tasks.filter((x) => x.id !== id);
     S.pending[id] = { op: 'del' };
+    if (pullEdits) pullEdits[id] = S.pending[id];
     S.sel.delete(id);
   }
   S.sync = 'pending';
@@ -241,9 +273,18 @@ function normalize(t) {
   const n = Object.assign({ title: '', notes: '', due: null, time: null, priority: 3, status: 'todo', project: '', tags: [], subtasks: [], attachments: [], repeat: 'none', remind: 'none', history: [], createdAt: nowIso(), doneAt: null, deletedAt: null }, t);
   n.priority = [1, 2, 3, 4].includes(+n.priority) ? +n.priority : 3;
   if (!STATUS[n.status]) n.status = 'todo';
-  n.subtasks = (n.subtasks || []).map((s) => ({ id: s.id || rid('s'), text: String(s.text || ''), done: !!s.done }));
-  n.tags = Array.isArray(n.tags) ? n.tags : [];
-  n.attachments = Array.isArray(n.attachments) ? n.attachments : [];
+  n.title = String(n.title || ''); n.notes = String(n.notes || ''); n.project = String(n.project || '');
+  if (!isYmd(n.due)) n.due = null;
+  if (!isHm(n.time)) n.time = null;
+  if (!REPEAT[n.repeat]) n.repeat = 'none';
+  if (!REMIND[n.remind]) n.remind = 'none';
+  if (!isIso(n.createdAt)) n.createdAt = nowIso();
+  if (!isIso(n.doneAt)) n.doneAt = null;
+  if (n.deletedAt != null && !isIso(n.deletedAt)) n.deletedAt = nowIso();
+  n.history = (Array.isArray(n.history) ? n.history : []).filter((h) => h && typeof h === 'object');
+  n.subtasks = (Array.isArray(n.subtasks) ? n.subtasks : []).filter(s => s && typeof s === 'object').map((s) => ({ id: s.id || rid('s'), text: String(s.text || ''), done: !!s.done }));
+  n.tags = (Array.isArray(n.tags) ? n.tags : []).filter((g) => typeof g === 'string' && g.trim());
+  n.attachments = (Array.isArray(n.attachments) ? n.attachments : []).filter((a) => a && typeof a === 'object');
   return n;
 }
 function logout(msg) {
@@ -298,14 +339,14 @@ function nextDue(s, rep, t) {
       if (!sel.length) d.setDate(d.getDate() + 7 * n);
       else { const cur = mon(d.getDay()); const nx = sel.find((x) => x > cur); d.setDate(d.getDate() + (nx != null ? nx - cur : 7 - cur + 7 * (n - 1) + sel[0])); }
     } else if (u === 'month') addMonths(n);
-    else d.setFullYear(d.getFullYear() + n);
+    else addMonths(12 * n);
     return ymd(d);
   }
   if (rep === 'daily') d.setDate(d.getDate() + 1);
   else if (rep === 'weekdays') { do { d.setDate(d.getDate() + 1); } while (d.getDay() === 0 || d.getDay() === 6); }
   else if (rep === 'weekly') d.setDate(d.getDate() + 7);
   else if (rep === 'monthly') { const day = d.getDate(); d.setDate(1); d.setMonth(d.getMonth() + 1); const last = new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate(); d.setDate(Math.min(day, last)); }
-  else if (rep === 'yearly') d.setFullYear(d.getFullYear() + 1);
+  else if (rep === 'yearly') { const month = d.getMonth(); d.setFullYear(d.getFullYear() + 1); if (d.getMonth() !== month) d.setDate(0); }
   return ymd(d);
 }
 function fileKind(name) {
@@ -383,18 +424,18 @@ function renderRail() {
 }
 function syncBadge() {
   const n = Object.keys(S.pending || {}).length;
-  if (S.sync === 'offline') return '<span class="sync offline"><i></i>Офлайн · ' + n + ' змін чекають</span>';
-  if (S.sync === 'error' && n) return '<span class="sync offline" title="' + esc(S.syncErr || '') + '"><i></i>Не синхронізовано (' + n + ')</span>';
+  if (S.sync === 'offline') return '<span class="sync offline"><i></i>Офлайн' + (n ? ' · змін у черзі: ' + n : ' · локальні дані') + '</span>';
+  if (S.sync === 'error') return '<span class="sync offline" title="' + esc(S.syncErr || '') + '"><i></i>' + (n ? 'Не синхронізовано (' + n + ')' : 'Не вдалося оновити дані') + '</span>';
   if (n) return '<span class="sync pending"><i></i>Синхронізація… (' + n + ')</span>';
-  return '<span class="sync"><i></i>Синхронізовано' + (S.lastSync ? ' о ' + pad(S.lastSync.getHours()) + ':' + pad(S.lastSync.getMinutes()) : '') + '</span>';
+  return '<span class="sync"><i></i>' + (S.lastSync ? 'Синхронізовано о ' + pad(S.lastSync.getHours()) + ':' + pad(S.lastSync.getMinutes()) : 'Очікуємо синхронізації') + '</span>';
 }
-function renderSync() { const el = document.getElementById('sync'); if (el) el.innerHTML = syncBadge(); }
+function renderSync() { const el = document.getElementById('sync'); if (el) el.innerHTML = syncBadge(); document.querySelectorAll('[data-sync-status]').forEach((el) => { el.innerHTML = syncBadge(); }); }
 
 function headHTML(eyebrow, title, opts) {
   opts = opts || {};
   return '<div class="head"><div><div class="eyebrow">' + eyebrow + '</div><h1>' + title + '</h1></div><div class="head-right">' + (opts.right || '')
     + (opts.noSelect ? '' : '<button class="btn' + (S.selectMode ? ' on' : '') + '" data-act="select-mode" title="Вибрати кілька задач">' + I.select + (S.selectMode ? 'Вибір увімкнено' : 'Вибрати') + '</button>')
-    + (opts.noNew ? '' : '<button class="btn primary" data-act="new">' + I.plus + '<span class="lbl-long">Нова задача</span></button>') + '</div></div>';
+    + (opts.noNew ? '' : '<button class="btn primary" data-act="new">' + I.plus + '<span class="lbl-long">Нова задача</span></button>') + '</div><button class="mobile-sync" data-act="sync-now" title="Синхронізувати зараз" data-sync-status>' + syncBadge() + '</button></div>';
 }
 function metric(k, v, cls) { return '<div class="metric ' + cls + '"><div class="k">' + k + '</div><div class="v num">' + v + '</div></div>'; }
 function emptyStart() {
@@ -547,7 +588,9 @@ function viewCalendar() {
 function viewBoard() {
   const cols = [['todo', 'Заплановано', 'var(--p4)'], ['doing', 'В роботі', 'var(--p3)'], ['done', 'Виконано', 'var(--ok)']];
   const since = Date.now() - 14 * 86400000;
-  let h = headHTML('Статуси', 'Дошка', { noSelect: true });
+  const fp = S.f.project;
+  const filterBtn = fp ? '<button class="btn" data-act="board-all" title="Показати задачі всіх проєктів">' + I.folder + esc(fp === '—' ? 'Без проєкту' : fp) + I.close + '</button>' : '';
+  let h = headHTML('Статуси', 'Дошка', { noSelect: true, right: filterBtn });
   h += '<div class="board">' + cols.map((c) => {
     let list = live().filter((t) => t.status === c[0]);
     if (S.f.project) list = list.filter((t) => (S.f.project === '—' ? !t.project : t.project === S.f.project));
@@ -688,10 +731,10 @@ function markDone(t) {
 
 /* ---------- картка задачі (бічна панель) ---------- */
 function drawerTask() { return S.draft || (S.openId ? getTask(S.openId) : null); }
-function openTask(id) { if (S.selectMode) return; S.draft = null; S.openId = id; renderDrawer(); }
-function newTask(defaults) { S.openId = null; S.draft = normalize(Object.assign({ id: rid() }, defaults || {})); renderDrawer(true); }
+function openTask(id) { if (S.selectMode) return; flushDebounced(); S.draft = null; S.openId = id; renderDrawer(); }
+function newTask(defaults) { flushDebounced(); S.openId = null; S.draft = normalize(Object.assign({ id: rid() }, defaults || {})); renderDrawer(true); }
 function closeDrawer() {
-  if (S.openId) flushDebounced();
+  flushDebounced();
   const t = S.openId && getTask(S.openId);
   if (t && t.subtasks.some((s) => !s.text.trim())) { const nt = clone(t); nt.subtasks = nt.subtasks.filter((s) => s.text.trim()); apply([nt]); }
   S.openId = null; S.draft = null; document.getElementById('drawer-root').innerHTML = '';
@@ -703,6 +746,7 @@ function quickDates(t) {
     + (t.due ? '<button data-act="dr-due" data-v="">Без терміну</button>' : '') + '</div>';
 }
 function renderDrawer(focusTitle, focusSub) {
+  flushDebounced();
   const t = drawerTask(); const root = document.getElementById('drawer-root');
   if (!t) { root.innerHTML = ''; return; }
   const body = root.querySelector('.dr-body'); const scroll = body ? body.scrollTop : 0;
@@ -712,7 +756,6 @@ function renderDrawer(focusTitle, focusSub) {
   const ups = Object.values(S.uploads).filter((u) => u.taskId === t.id);
   root.innerHTML = '<div class="scrim" data-act="close"></div><div class="drawer" role="dialog" aria-modal="true" aria-label="Редагування задачі">'
     + '<div class="dr-head"><span class="eyebrow">' + (S.draft ? 'Нова задача' : 'Задача') + '</span>'
-    + (!S.draft ? '<button class="btn ' + (isDone(t) ? '' : 'primary') + '" data-act="dr-done">' + (isDone(t) ? '↺ Повернути' : I.check.replace('stroke-width="3.5"', 'stroke-width="3"') + 'Виконано') + '</button>' : '')
     + '<button class="icon-btn" data-act="close" aria-label="Закрити">' + I.close + '</button></div>'
     + '<div class="dr-body">'
     + '<textarea class="dr-title" id="f-title" rows="1" placeholder="Назва задачі">' + esc(t.title) + '</textarea>'
@@ -742,7 +785,7 @@ function renderDrawer(focusTitle, focusSub) {
     + '<div><label class="lbl" for="f-repeat">Повторення</label>' + sel('f-repeat', t.repeat || 'none', Object.keys(REPEAT).map((k) => [k, REPEAT[k]])) + '</div></div>'
     + repeatCustomHTML(t)
     + '<div><label class="lbl" for="f-tags">Мітки</label><input class="field" id="f-tags" value="' + esc((t.tags || []).join(', ')) + '" placeholder="через кому: дзвінок, документи" autocomplete="off"></div>'
-    + '<div><label class="lbl" for="f-notes">Нотатки</label><textarea class="field" id="f-notes" rows="5" placeholder="Деталі, посилання, контакти…">' + esc(t.notes) + '</textarea></div>'
+    + '<div><label class="lbl" for="f-notes">Нотатки</label><textarea class="field" id="f-notes" rows="5" maxlength="100000" placeholder="Деталі, посилання, контакти…">' + esc(t.notes) + '</textarea></div>'
     + (S.draft ? '' : historyHTML(t))
     + '<div class="meta-note">' + (S.draft ? 'Задача збережеться, щойно ви впишете назву.' : 'Створено ' + esc(fmtDT(t.createdAt)) + (t.updatedAt ? ' · змінено ' + esc(fmtDT(t.updatedAt)) : '') + (t.doneAt ? ' · виконано ' + esc(fmtDT(t.doneAt)) : '')) + '</div>'
     + '</div><div class="dr-foot">'
@@ -803,6 +846,20 @@ function editTask(patch, opts) {
 }
 function renderDrawerHeadOnly() { if (!drawerBusy()) renderDrawer(); else { const e = document.querySelector('.drawer .eyebrow'); if (e) e.textContent = 'Задача'; } }
 const debouncers = {};
+function debouncedTask(key, patch, ms) {
+  const id = drawerTask()?.id;
+  if (!id) return;
+  debounced(key, () => {
+    if (S.draft?.id === id) {
+      editTask(typeof patch === 'function' ? patch(S.draft) : patch);
+      return;
+    }
+    const task = getTask(id);
+    if (!task || task.deletedAt) return;
+    const changes = typeof patch === 'function' ? patch(task) : patch;
+    apply([Object.assign(clone(task), changes)]);
+  }, ms);
+}
 function debounced(key, fn, ms) {
   cancelDebounce(key);
   const d = { fn, timer: null };
@@ -848,12 +905,14 @@ async function openFile(a, download) {
     toast('Відкриваю «' + shortT(a.name) + '»…');
     const blob = await fetchFile(a);
     const url = URL.createObjectURL(new Blob([blob], { type: a.type || blob.type || 'application/octet-stream' }));
-    const inline = /^(image\/|application\/pdf|text\/)/.test(a.type || '');
+    const inline = inlineViewable(a.type);
     if (win && inline) win.location.href = url;
     else { if (win) win.close(); saveBlobUrl(url, a.name); }
     setTimeout(() => URL.revokeObjectURL(url), 60000);
   } catch (e) { if (win) win.close(); toast(e.message || 'Не вдалося відкрити файл'); }
 }
+// Blob-адреса має origin застосунку: HTML чи SVG у ній виконали б скрипти з доступом до пароля.
+const inlineViewable = (type) => /^(image\/(png|jpe?g|gif|webp|avif|bmp)|application\/pdf|text\/plain)(;|$)/i.test(String(type || ''));
 function saveBlobUrl(url, name) { const el = document.createElement('a'); el.href = url; el.download = name; document.body.appendChild(el); el.click(); el.remove(); }
 function saveBlob(blob, name) { const url = URL.createObjectURL(blob); saveBlobUrl(url, name); setTimeout(() => URL.revokeObjectURL(url), 30000); }
 function scheduleBlobCleanup(a) {
@@ -1028,9 +1087,11 @@ function doImport() {
   const imp = S.imp; const stamp = nowIso();
   const list = imp.drafts.filter((d) => d.on && String(d.title || '').trim());
   const puts = list.map((d) => {
-    const base = imp.backup && d.id ? (getTask(d.id) ? clone(getTask(d.id)) : {}) : {};
+    // сервер відхиляє весь пакет через один некоректний id, тож такі задачі отримують новий
+    const keepId = imp.backup && ID_RE.test(String(d.id || ''));
+    const base = keepId && getTask(String(d.id)) ? clone(getTask(String(d.id))) : {};
     const t = normalize(Object.assign(base, {
-      id: imp.backup && d.id ? String(d.id) : rid(),
+      id: keepId ? String(d.id) : rid(),
       title: String(d.title).trim(), due: d.due || imp.defaults.due || null, time: d.time || null,
       priority: +d.priority || 3, status: d.status || 'todo', project: (d.project || imp.defaults.project || '').trim(),
       subtasks: (d.subtasks || []).map((s) => ({ id: s.id || rid('s'), text: s.text, done: !!s.done })),
@@ -1040,7 +1101,7 @@ function doImport() {
     }));
     t.doneAt = t.status === 'done' ? (d.doneAt || stamp) : null;
     if (imp.backup) { ['repeatEvery', 'repeatUnit', 'repeatDays', 'remind', 'remindCustom', 'history', 'updatedAt', 'time'].forEach((k) => { if (d[k] != null) t[k] = d[k]; }); t.deletedAt = null; }
-    return t;
+    return normalize(t);
   });
   closeModal();
   apply(puts, [], 'Імпортовано ' + puts.length + ' ' + plural(puts.length, TASKS_W), { flushDelay: 0 });
@@ -1092,7 +1153,7 @@ function settingsHTML() {
     + '<div class="set-row"><button class="btn danger" data-act="clear-done"' + (doneN ? '' : ' disabled') + '>' + I.trash + 'Видалити виконані (' + doneN + ')</button></div></div>'
     + backupsHTML()
     + '<div class="set-sec"><h3>Синхронізація</h3><div class="help">' + syncBadge() + '<br>Задач: ' + S.tasks.length + '. Дані зберігаються на сервері й у цьому браузері, тож застосунок працює і без інтернету.</div>'
-    + '<div class="set-row"><button class="btn" data-act="sync-now">Синхронізувати зараз</button><button class="btn" data-act="logout">Вийти на цьому пристрої</button></div></div>'
+    + '<div class="set-row"><button class="btn" data-act="sync-now">Синхронізувати зараз</button><button class="btn" data-act="logout" title="Задачі зникнуть із цього пристрою, на сервері вони залишаться">Вийти на цьому пристрої</button></div></div>'
     + '</div></div>';
 }
 
@@ -1114,7 +1175,11 @@ function deviceName() {
   return os + ' · ' + br;
 }
 async function loadPushInfo() { try { S.pushInfo = await apiJson('GET', '/api/push'); } catch (e) { S.pushInfo = { error: e.message }; } }
-async function loadBackups() { try { S.backups = (await apiJson('GET', '/api/backup')).backups; } catch (e) { S.backups = []; } }
+async function loadBackups() {
+  S.backupError = '';
+  try { S.backups = (await apiJson('GET', '/api/backup')).backups; }
+  catch (e) { S.backups = null; S.backupError = e.message; }
+}
 async function pushOn() {
   S.pushBusy = true; renderModal();
   try {
@@ -1133,13 +1198,21 @@ async function pushOn() {
   } catch (e) { toast(e.message || 'Не вдалося увімкнути сповіщення'); }
   finally { S.pushBusy = false; await loadPushInfo(); renderModal(); if (S.openId) renderDrawer(); }
 }
-async function pushOff() {
+async function pushOff(quiet) {
   try {
     const reg = await navigator.serviceWorker.ready; const sub = await reg.pushManager.getSubscription();
     if (sub) { await apiJson('POST', '/api/push', { action: 'unsubscribe', endpoint: sub.endpoint }).catch(() => {}); await sub.unsubscribe(); }
   } catch (e) { /* немає підписки */ }
   try { localStorage.removeItem('kz.push'); } catch (e) {}
+  if (quiet) return;
   toast('Сповіщення на цьому пристрої вимкнено'); await loadPushInfo(); renderModal();
+}
+/* Вихід за кнопкою: на пристрої не лишається ні задач, ні сповіщень із їхніми назвами. */
+async function signOut() {
+  if (pushState() === 'on') await pushOff(true);
+  logout('');
+  S.tasks = []; S.pending = {}; S.undo = null;
+  [LKEY, PKEY, 'kz.fired'].forEach((k) => { try { localStorage.removeItem(k); } catch (e) {} });
 }
 function notifHTML() {
   const info = S.pushInfo; const st = pushState(); const sup = pushSupported();
@@ -1162,7 +1235,8 @@ function notifHTML() {
 }
 function backupsHTML() {
   let h = '<div class="set-sec"><h3>Резервні копії на сервері</h3><div class="help">Сервер щодня зберігає копію всіх задач і тримає її 30 днів. З копії можна відновити все або окремі задачі.</div>';
-  if (!S.backups) h += '<div class="help">Завантажую список…</div>';
+  if (S.backupError) h += '<div class="help" role="alert">Не вдалося завантажити копії: ' + esc(S.backupError) + '</div><button class="btn" data-act="backup-retry">Спробувати ще раз</button>';
+  else if (!S.backups) h += '<div class="help">Завантажую список…</div>';
   else if (!S.backups.length) h += '<div class="help">Копій ще немає. Перша з’явиться протягом доби, або натисніть «Зробити копію зараз».</div>';
   else h += '<div class="bk-list">' + S.backups.slice(0, 10).map((b) => '<div class="bk"><span>' + esc(cap(fmt(b.date, { weekday: 'short', day: 'numeric', month: 'long' }))) + '</span><button class="btn ghost" data-act="backup-restore" data-date="' + b.date + '">Переглянути й відновити</button></div>').join('') + '</div>';
   return h + '<div class="set-row"><button class="btn" data-act="backup-now">Зробити копію зараз</button></div></div>';
@@ -1228,9 +1302,9 @@ const A = {
     editTask({ status: v, doneAt: v === 'done' ? nowIso() : null }, { rerender: true });
   },
   'dr-due': (el) => editTask({ due: el.dataset.v || null, time: el.dataset.v ? drawerTask().time : null }, { rerender: true }),
-  'dr-done': () => { const t = drawerTask(); if (t) { toggleDone(t); renderDrawer(); } },
   'dr-delete': () => { const t = drawerTask(); if (!t) return; closeDrawer(); trashTasks([t.id], 'У кошику: ' + shortT(t.title)); },
   'dr-dup': () => {
+    flushDebounced();
     const t = drawerTask(); if (!t) return;
     const nt = clone(t); nt.id = rid(); nt.title = t.title + ' (копія)'; nt.createdAt = nowIso(); nt.status = 'todo'; nt.doneAt = null; nt.history = [];
     nt.subtasks = nt.subtasks.map((s) => Object.assign({}, s, { id: rid('s') }));
@@ -1249,6 +1323,7 @@ const A = {
   'push-off': () => pushOff(),
   'push-test': async () => { try { const r = await apiJson('POST', '/api/push', { action: 'test' }); toast(r.sent ? 'Надіслано на ' + r.sent + ' ' + plural(r.sent, ['пристрій', 'пристрої', 'пристроїв']) : 'Немає пристроїв зі сповіщеннями'); } catch (e) { toast(e.message); } },
   'backup-now': async () => { try { const r = await apiJson('POST', '/api/backup'); toast('Копію збережено: ' + r.count + ' ' + plural(r.count, TASKS_N)); await loadBackups(); renderModal(); } catch (e) { toast(e.message); } },
+  'backup-retry': async () => { await loadBackups(); if (S.modal === 'settings') renderModal(); },
   'backup-restore': async (el) => {
     try {
       const date = el.dataset.date; const j = await apiJson('GET', '/api/backup?date=' + encodeURIComponent(date));
@@ -1308,8 +1383,18 @@ const A = {
   'export-xlsx': () => exportExcel(),
   'export-json': () => exportJSON(),
   'clear-done': () => { const ids = live().filter(isDone).map((t) => t.id); trashTasks(ids, 'Виконані переміщено в кошик: ' + ids.length); renderModal(); },
-  'sync-now': () => { flush(); pull().then(() => { toast('Синхронізовано'); if (S.modal === 'settings') renderModal(); }); },
-  logout: () => logout('')
+  'sync-now': async () => {
+    const saved = await flush();
+    const ok = saved && await pull();
+    toast(ok && S.sync === 'ok' ? 'Синхронізовано' : (S.syncErr || 'Синхронізація ще не завершена'));
+    if (S.modal === 'settings') renderModal();
+  },
+  logout: (el) => {
+    const n = Object.keys(S.pending).length;
+    if (n && el.dataset.armed !== '1') { el.dataset.armed = '1'; el.classList.add('danger', 'armed'); el.textContent = 'Не збережено змін: ' + n + '. Однаково вийти?'; return; }
+    signOut();
+  },
+  'board-all': () => { S.f.project = ''; renderMain(); }
 };
 
 document.addEventListener('click', (e) => {
@@ -1318,6 +1403,17 @@ document.addEventListener('click', (e) => {
   if (fn) { if (el.dataset.act !== 'modal-scrim') e.preventDefault(); fn(el, idEl ? idEl.dataset.id : null, e); }
 });
 document.addEventListener('keydown', (e) => {
+  if (e.isComposing) return;
+  if (e.key === 'Tab' && (S.modal || S.openId || S.draft)) {
+    const dialog = document.querySelector(S.modal ? '#modal-root [role="dialog"]' : '#drawer-root [role="dialog"]');
+    if (dialog) {
+      const controls = [...dialog.querySelectorAll('button:not(:disabled),input:not(:disabled),select:not(:disabled),textarea:not(:disabled),a[href],[tabindex="0"]')].filter((el) => el.getClientRects().length);
+      const first = controls[0], last = controls[controls.length - 1];
+      if (first && (!dialog.contains(document.activeElement) || (e.shiftKey ? document.activeElement === first : document.activeElement === last))) {
+        e.preventDefault(); (e.shiftKey ? last : first).focus(); return;
+      }
+    }
+  }
   const tag = (e.target.tagName || '').toLowerCase();
   const typing = tag === 'input' || tag === 'textarea' || tag === 'select' || e.target.isContentEditable;
   if (e.key === 'Escape') {
@@ -1373,9 +1469,9 @@ document.addEventListener('input', (e) => {
   const t = e.target;
   if (t.closest && t.closest('[data-form="quick"]')) updateHint(t);
   if (t.id === 'f-q') { S.f.q = t.value; debounced('q', renderMain, 160); }
-  if (t.id === 'f-title') { autosize(t); const v = t.value; if (!S.draft) debounced('title', () => editTask({ title: v.trim() || 'Без назви' }), 500); }
-  if (t.id === 'f-notes') { const v = t.value; if (!S.draft) debounced('notes', () => editTask({ notes: v }), 600); }
-  if (t.classList && t.classList.contains('sub-text')) { const sid = t.closest('[data-sid]').dataset.sid; const v = t.value; debounced('sub' + sid, () => { const tk = drawerTask(); if (tk) editTask({ subtasks: tk.subtasks.map((s) => (s.id === sid ? Object.assign({}, s, { text: v }) : s)) }); }, 500); }
+  if (t.id === 'f-title') { autosize(t); const v = t.value; if (!S.draft) debouncedTask('title', { title: v.trim() || 'Без назви' }, 500); }
+  if (t.id === 'f-notes') { const v = t.value; if (!S.draft) debouncedTask('notes', { notes: v }, 600); }
+  if (t.classList && t.classList.contains('sub-text')) { const sid = t.closest('[data-sid]').dataset.sid; const v = t.value; debouncedTask('sub' + sid, tk => ({ subtasks: tk.subtasks.map(s => s.id === sid ? Object.assign({}, s, { text: v }) : s) }), 500); }
   if (t.dataset && t.dataset.imp && S.imp) { const i = +t.closest('tr').dataset.i; const k = t.dataset.imp; if (k === 'title' || k === 'project') S.imp.drafts[i][k] = t.value; }
   if (t.id === 'imp-text' && S.imp) S.imp.text = t.value;
 });
@@ -1489,8 +1585,10 @@ document.addEventListener('submit', (e) => {
     apiJson('GET', '/api/tasks').then((j) => {
       try { localStorage.setItem(TKEY, v); } catch (x) {}
       S.loginErr = ''; S.mode = 'app';
-      const map = new Map(S.tasks.map((t) => [t.id, t]));
-      (j.tasks || []).forEach((t) => map.set(t.id, normalize(t)));
+      const map = new Map((j.tasks || []).map(t => [t.id, normalize(t)]));
+      for (const [id, op] of Object.entries(S.pending)) {
+        if (op.op === 'put') map.set(id, op.task); else map.delete(id);
+      }
       S.tasks = [...map.values()]; S.lastSync = new Date(); persistLocal(); renderMain();
       if (Object.keys(S.pending).length) scheduleFlush(0);
     }).catch((x) => { TOKEN = null; err.textContent = x.code === 'auth' ? 'Невірний пароль.' : x.message; });
@@ -1583,8 +1681,8 @@ function boot() {
   loadLocal();
   if (!TOKEN) { S.mode = 'login'; renderMain(); return; }
   S.mode = 'app'; S.sync = Object.keys(S.pending).length ? 'pending' : 'ok';
-  renderMain(); openFromHash();
-  pull().then(() => { purgeOldTrash(); checkLocalReminders(); });
+  renderMain(); if (S.tasks.length) openFromHash();
+  pull().then(() => { openFromHash(); purgeOldTrash(); checkLocalReminders(); });
   if (matchMedia('(pointer:coarse)').matches && !lsGet('kz.tip.swipe', false)) {
     lsSet('kz.tip.swipe', true);
     setTimeout(() => toast('Порада: проведіть по задачі вправо, щоб виконати, або вліво, щоб перенести на завтра', { long: true }), 1500);
@@ -1593,10 +1691,10 @@ function boot() {
 if (navigator.serviceWorker) navigator.serviceWorker.addEventListener('message', (e) => { if (e.data && e.data.type === 'open' && e.data.id && S.mode === 'app') openTask(e.data.id); });
 window.addEventListener('hashchange', openFromHash);
 setInterval(() => { if (TOKEN && document.visibilityState === 'visible' && !flushing) pull(); }, 20000);
-document.addEventListener('visibilitychange', () => { if (TOKEN && document.visibilityState === 'visible') pull(); else if (TOKEN) flush(); });
+document.addEventListener('visibilitychange', () => { if (document.visibilityState !== 'visible') flushDebounced(); if (TOKEN && document.visibilityState === 'visible') pull(); else if (TOKEN) flush(); });
 window.addEventListener('online', () => { if (TOKEN) { flush(); pull(); } });
 window.addEventListener('offline', () => { S.sync = 'offline'; renderSync(); });
-window.addEventListener('beforeunload', () => { persistLocal(); });
+window.addEventListener('beforeunload', () => { flushDebounced(); persistLocal(); });
 let lastDay = todayStr();
 setInterval(() => { const d = todayStr(); if (d !== lastDay) { lastDay = d; renderMain(); } }, 60000);
 boot();

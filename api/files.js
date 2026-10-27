@@ -29,7 +29,8 @@ async function readRaw(req) {
   return Buffer.concat(chunks);
 }
 
-const safeName = (n) => String(n || 'file').replace(/[\\/:*?"<>|\u0000-\u001f]+/g, '_').slice(0, 150) || 'file';
+const SAFE_INLINE = /^(image\/(png|jpe?g|gif|webp|avif|bmp)|application\/pdf|text\/plain)(;|$)/i;
+const safeName =(n) => String(n || 'file').replace(/[\\/:*?"<>|\u0000-\u001f]+/g, '_').slice(0, 150) || 'file';
 
 export default async function handler(req, res) {
   if (!(await guard(req, res, { needRedis: false }))) return;
@@ -61,8 +62,12 @@ export default async function handler(req, res) {
       const r = await get(pathname, { access });
       if (!r || r.statusCode !== 200) return res.status(404).json({ error: 'not_found', message: 'Файл не знайдено' });
       const name = safeName(req.query.name || pathname.split('/').pop());
-      res.setHeader('Content-Type', r.blob.contentType || 'application/octet-stream');
-      res.setHeader('Content-Disposition', `${req.query.download ? 'attachment' : 'inline'}; filename*=UTF-8''${encodeURIComponent(name)}`);
+      const type = r.blob.contentType || 'application/octet-stream';
+      // HTML, SVG тощо лише як завантаження: інакше їхні скрипти виконалися б на адресі застосунку
+      const inline = !req.query.download && SAFE_INLINE.test(type);
+      res.setHeader('Content-Type', type);
+      res.setHeader('Content-Disposition', `${inline ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeURIComponent(name)}`);
+      res.setHeader('Content-Security-Policy', "script-src 'none'");
       res.setHeader('Cache-Control', 'private, max-age=300');
       const buf = Buffer.from(await new Response(r.stream).arrayBuffer());
       return res.status(200).send(buf);

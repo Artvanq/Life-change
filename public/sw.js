@@ -1,13 +1,13 @@
 // Офлайн-режим: оболонка застосунку і бібліотеки для читання Word/Excel.
-const CACHE = 'kontrol-v3';
-const SHELL = ['/', '/styles.css?v=3', '/importer.js?v=3', '/app.js?v=3', '/manifest.webmanifest', '/icon.svg', '/icon-192.png', '/icon-512.png', '/apple-touch-icon.png'];
+const CACHE = 'kontrol-v5';
+const SHELL = ['/', '/styles.css?v=5', '/importer.js?v=5', '/app.js?v=5', '/manifest.webmanifest', '/icon.svg', '/icon-192.png', '/icon-512.png', '/apple-touch-icon.png'];
 const CDN = ['cdnjs.cloudflare.com', 'cdn.jsdelivr.net', 'fonts.googleapis.com', 'fonts.gstatic.com'];
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));
 });
 self.addEventListener('activate', (e) => {
-  e.waitUntil(caches.keys().then((keys) => Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k)))).then(() => self.clients.claim()));
+  e.waitUntil(caches.keys().then((keys) => Promise.all(keys.filter((k) => k.startsWith('kontrol-') && k !== CACHE).map((k) => caches.delete(k)))).then(() => self.clients.claim()));
 });
 self.addEventListener('fetch', (e) => {
   const req = e.request;
@@ -16,7 +16,7 @@ self.addEventListener('fetch', (e) => {
   if (url.pathname.startsWith('/api/')) return; // дані завжди з мережі
 
   if (req.mode === 'navigate') { // сторінка: мережа, без мережі — кеш
-    e.respondWith(fetch(req).then((r) => { const c = r.clone(); caches.open(CACHE).then((x) => x.put('/', c)); return r; }).catch(() => caches.match('/')));
+    e.respondWith(fetch(req).then((r) => { if (r.ok) { const c = r.clone(); caches.open(CACHE).then((x) => x.put('/', c)); } return r; }).catch(() => caches.match('/')));
     return;
   }
   if (url.origin === location.origin) { // свої файли: віддати з кешу й оновити у фоні
